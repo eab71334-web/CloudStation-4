@@ -162,16 +162,17 @@ class _HomeState extends State<Home> {
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
-          title: Text(tab == 0 ? 'Users' : 'Codes'),
+          title: Text(['Users', 'Codes', 'Hosts'][tab]),
           actions: [IconButton(icon: const Icon(Icons.logout), onPressed: widget.onLogout)],
         ),
-        body: tab == 0 ? UsersTab(api: widget.api) : CodesTab(api: widget.api),
+        body: [UsersTab(api: widget.api), CodesTab(api: widget.api), HostsTab(api: widget.api)][tab],
         bottomNavigationBar: NavigationBar(
           selectedIndex: tab,
           onDestinationSelected: (i) => setState(() => tab = i),
           destinations: const [
             NavigationDestination(icon: Icon(Icons.people), label: 'Users'),
             NavigationDestination(icon: Icon(Icons.vpn_key), label: 'Codes'),
+            NavigationDestination(icon: Icon(Icons.phone_iphone), label: 'Hosts'),
           ],
         ),
       );
@@ -364,6 +365,117 @@ class _CodesTabState extends State<CodesTab> {
                       trailing: active
                           ? IconButton(icon: const Icon(Icons.cancel_outlined), onPressed: () => _revoke(c['code']))
                           : null,
+                    );
+                  },
+                ),
+        ),
+      );
+}
+
+// ---------- Hosts ----------
+class HostsTab extends StatefulWidget {
+  final Api api;
+  const HostsTab({super.key, required this.api});
+  @override
+  State<HostsTab> createState() => _HostsTabState();
+}
+
+class _HostsTabState extends State<HostsTab> {
+  List hosts = [];
+  String? error;
+  Timer? timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    timer = Timer.periodic(const Duration(seconds: 10), (_) => _load());
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final d = await widget.api.get('/admin/hosts');
+      if (mounted) setState(() { hosts = d; error = null; });
+    } catch (e) {
+      if (mounted) setState(() => error = '$e');
+    }
+  }
+
+  Future<void> _create() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('New host'),
+        content: TextField(controller: ctrl, decoration: const InputDecoration(labelText: 'Host name')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(c, ctrl.text), child: const Text('Create')),
+        ],
+      ),
+    );
+    if (name == null) return;
+    try {
+      final r = await widget.api.post('/admin/hosts', {'name': name});
+      await Clipboard.setData(ClipboardData(text: r['key']));
+      if (!mounted) return;
+      await showDialog(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: const Text('Host key (shown once, copied)'),
+          content: SelectableText(r['key']),
+          actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('OK'))],
+        ),
+      );
+      _load();
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _delete(Map h) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: Text('Delete ${h['name']}?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await widget.api.del('/admin/hosts/${h['id']}');
+    _load();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        floatingActionButton: FloatingActionButton(onPressed: _create, child: const Icon(Icons.add)),
+        body: RefreshIndicator(
+          onRefresh: _load,
+          child: hosts.isEmpty
+              ? ListView(children: [
+                  Padding(padding: const EdgeInsets.all(40), child: Center(child: Text(error ?? 'No hosts yet')))
+                ])
+              : ListView.separated(
+                  itemCount: hosts.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (_, i) {
+                    final h = hosts[i];
+                    return ListTile(
+                      leading: CircleAvatar(
+                          radius: 7,
+                          backgroundColor: h['online'] == true ? Colors.green : Colors.grey),
+                      title: Text('${h['name']}'),
+                      subtitle: Text('${h['state']}  •  ${h['game'] ?? '-'}'),
+                      trailing: IconButton(icon: const Icon(Icons.delete_outline), onPressed: () => _delete(h)),
                     );
                   },
                 ),
