@@ -7,7 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 // TODO: put your deployed server URL here (no trailing slash)
-const kServerUrl = 'https://YOUR-SERVER-URL';
+const kServerUrl = 'https://cloudstation-server.onrender.com';
 
 void main() => runApp(const App());
 
