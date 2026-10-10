@@ -32,10 +32,17 @@ jobs:
         with: { channel: stable }
       - run: flutter create --platforms=ios .
       - run: flutter pub get
-      - run: flutter build ios --release --no-codesign
+      - run: flutter build ios --config-only --release --no-codesign
+      - run: |
+          if [ -f ios/Podfile ]; then (cd ios && pod install); fi
+      - run: |
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner \
+            -configuration Release -sdk iphoneos -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
       - run: |
           mkdir Payload
-          cp -r build/ios/iphoneos/Runner.app Payload/
+          cp -r "$(find build -type d -name Runner.app -path "*Release-iphoneos*" | head -n 1)" Payload/
           zip -r client.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
