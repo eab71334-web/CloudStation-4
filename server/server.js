@@ -19,6 +19,14 @@ CREATE TABLE IF NOT EXISTS users (
   token TEXT UNIQUE, status TEXT DEFAULT 'active', muted INTEGER DEFAULT 0,
   created_at INTEGER, last_seen INTEGER
 );
+CREATE TABLE IF NOT EXISTS hosts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, key_hash TEXT UNIQUE,
+  state TEXT DEFAULT 'idle', game TEXT, last_seen INTEGER DEFAULT 0, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS tickets (
+  id TEXT PRIMARY KEY, user_id INTEGER, host_id INTEGER,
+  status TEXT DEFAULT 'open', created_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, game TEXT,
   started_at INTEGER, last_ping INTEGER, ended_at INTEGER
@@ -130,6 +138,75 @@ app.delete("/admin/users/:id", adminOnly, (req, res) => {
 app.get("/admin/sessions", adminOnly, (_req, res) =>
   res.json(db.prepare(`SELECT s.*, u.name FROM sessions s JOIN users u ON u.id = s.user_id ORDER BY s.id DESC LIMIT 200`).all())
 );
+
+// ---------- hosts (iPhone relay between PS4 and users) ----------
+const sha = (v) => crypto.createHash("sha256").update(v).digest("hex");
+const hostAuth = (req, res, next) => {
+  const h = db.prepare("SELECT * FROM hosts WHERE key_hash = ?").get(sha(req.get("x-host-key") || ""));
+  if (!h) return res.status(401).json({ error: "invalid host key" });
+  req.hostRow = h;
+  next();
+};
+
+// owner: create / list / delete hosts (host key is shown once)
+app.post("/admin/hosts", adminOnly, (req, res) => {
+  const key = crypto.randomBytes(24).toString("hex");
+  const r = db.prepare("INSERT INTO hosts (name, key_hash, created_at) VALUES (?,?,?)")
+    .run(req.body.name || "host", sha(key), now());
+  res.json({ id: r.lastInsertRowid, key });
+});
+app.get("/admin/hosts", adminOnly, (_req, res) => {
+  const rows = db.prepare("SELECT id, name, state, game, last_seen FROM hosts ORDER BY id").all();
+  res.json(rows.map((h) => ({ ...h, online: h.last_seen > now() - 30 })));
+});
+app.delete("/admin/hosts/:id", adminOnly, (req, res) => {
+  db.prepare("UPDATE tickets SET status = 'closed' WHERE host_id = ?").run(req.params.id);
+  db.prepare("DELETE FROM hosts WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+// host app: heartbeat every ~5s. Reply lists tickets the host must disconnect (banned/deleted users).
+app.post("/host/heartbeat", hostAuth, (req, res) => {
+  db.prepare("UPDATE hosts SET state = ?, game = ?, last_seen = ? WHERE id = ?")
+    .run(req.body.state || "idle", req.body.game || null, now(), req.hostRow.id);
+  const bad = db.prepare(`SELECT t.id FROM tickets t LEFT JOIN users u ON u.id = t.user_id
+    WHERE t.host_id = ? AND t.status IN ('open','claimed') AND (u.id IS NULL OR u.status = 'banned')`)
+    .all(req.hostRow.id);
+  res.json({ disconnect: bad.map((b) => b.id) });
+});
+// host app: poll for users who were assigned to it
+app.get("/host/tickets", hostAuth, (req, res) => {
+  const rows = db.prepare(`SELECT t.id AS ticket, u.id AS userId, u.name, u.muted FROM tickets t
+    JOIN users u ON u.id = t.user_id WHERE t.host_id = ? AND t.status = 'open'`).all(req.hostRow.id);
+  const mark = db.prepare("UPDATE tickets SET status = 'claimed' WHERE id = ?");
+  rows.forEach((r) => mark.run(r.ticket));
+  res.json(rows.map((r) => ({ ...r, muted: !!r.muted })));
+});
+app.post("/host/tickets/:id/close", hostAuth, (req, res) => {
+  db.prepare("UPDATE tickets SET status = 'closed' WHERE id = ? AND host_id = ?").run(req.params.id, req.hostRow.id);
+  res.json({ ok: true });
+});
+
+// client app: ask for a free host
+app.post("/api/connect", userAuth, (req, res) => {
+  const t = now();
+  db.prepare("UPDATE tickets SET status = 'closed' WHERE status = 'open' AND created_at < ?").run(t - 60);
+  db.prepare(`UPDATE tickets SET status = 'closed' WHERE status = 'claimed'
+    AND user_id IN (SELECT id FROM users WHERE last_seen < ?)`).run(t - 90);
+  db.prepare("UPDATE tickets SET status = 'closed' WHERE user_id = ? AND status IN ('open','claimed')").run(req.user.id);
+  const host = db.prepare(`SELECT h.* FROM hosts h WHERE h.last_seen > ? AND h.state = 'idle'
+    AND NOT EXISTS (SELECT 1 FROM tickets x WHERE x.host_id = h.id AND x.status IN ('open','claimed'))
+    ORDER BY h.last_seen DESC LIMIT 1`).get(t - 30);
+  if (!host) return res.status(503).json({ error: "no host available" });
+  const id = crypto.randomBytes(12).toString("hex");
+  db.prepare("INSERT INTO tickets (id, user_id, host_id, created_at) VALUES (?,?,?,?)").run(id, req.user.id, host.id, t);
+  res.json({ ticket: id, hostId: host.id });
+});
+app.get("/api/ticket/:id", userAuth, (req, res) => {
+  const t = db.prepare("SELECT status, host_id FROM tickets WHERE id = ? AND user_id = ?").get(req.params.id, req.user.id);
+  if (!t) return res.status(404).json({ error: "not found" });
+  res.json(t);
+});
 
 // ---------- PS4 PKG app ----------
 // The PKG app polls this to show who is connected and what they play.
