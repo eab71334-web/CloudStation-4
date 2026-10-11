@@ -1,10 +1,10 @@
 {
   "name": "ps4-cloud-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "dependencies": {
-    "better-sqlite3": "^11.3.0",
+    "@libsql/client": "^0.14.0",
     "express": "^4.19.2"
   }
 }
