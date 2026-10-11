@@ -8,7 +8,7 @@ const ADMIN_KEY = process.env.ADMIN_KEY || "change-me-admin";
 const PS4_KEY = process.env.PS4_KEY || "change-me-ps4";
 const PORT = process.env.PORT || 3000;
 
-const db = new Database("data.db");
+const db = new Database(process.env.DB_PATH || "data.db"); // set DB_PATH=/var/data/data.db when a persistent disk is attached
 db.pragma("journal_mode = WAL");
 db.exec(`
 CREATE TABLE IF NOT EXISTS codes (
@@ -131,6 +131,10 @@ app.post("/admin/users/:id/unmute", adminOnly, (req, res) => {
   res.json({ ok: true });
 });
 app.delete("/admin/users/:id", adminOnly, (req, res) => {
+  // Deleting a user also revokes their code, otherwise the same code could simply be re-entered.
+  const u = db.prepare("SELECT code FROM users WHERE id = ?").get(req.params.id);
+  if (u) db.prepare("UPDATE codes SET status = 'revoked' WHERE code = ?").run(u.code);
+  db.prepare("UPDATE tickets SET status = 'closed' WHERE user_id = ?").run(req.params.id);
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(req.params.id);
   db.prepare("DELETE FROM users WHERE id = ?").run(req.params.id);
   res.json({ ok: true });
