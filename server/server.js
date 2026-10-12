@@ -7,6 +7,12 @@
 const express = require("express");
 const { createClient } = require("@libsql/client");
 const crypto = require("crypto");
+let WebSocketServer = null;
+try {
+  ({ WebSocketServer } = require("ws"));
+} catch (e) {
+  console.warn("[relay] 'ws' package not installed: relay disabled");
+}
 
 const ADMIN_KEY = process.env.ADMIN_KEY || "change-me-admin";
 const PS4_KEY = process.env.PS4_KEY || "change-me-ps4";
@@ -49,6 +55,9 @@ CREATE TABLE IF NOT EXISTS hosts (
 CREATE TABLE IF NOT EXISTS tickets (
   id TEXT PRIMARY KEY, user_id INTEGER, host_id INTEGER,
   status TEXT DEFAULT 'open', created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS consoles (
+  host_id INTEGER PRIMARY KEY, json TEXT, updated_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, game TEXT,
@@ -257,6 +266,133 @@ app.post("/host/tickets/:id/close", hostAuth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ---------- console credentials (registered once on the host, handed to valid users) ----------
+// JSON: { nickname, mac(hex), target(int), registKey(hex 16B), rpKey(hex 16B), rpKeyType(int) }
+app.post("/host/console", hostAuth, wrap(async (req, res) => {
+  await run(
+    `INSERT INTO consoles (host_id, json, updated_at) VALUES (?,?,?)
+     ON CONFLICT(host_id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`,
+    [req.hostRow.id, JSON.stringify(req.body || {}), now()]
+  );
+  res.json({ ok: true });
+}));
+app.get("/api/console/:ticket", userAuth, wrap(async (req, res) => {
+  const t = await one("SELECT * FROM tickets WHERE id = ? AND user_id = ? AND status IN ('open','claimed')", [req.params.ticket, req.user.id]);
+  if (!t) return res.status(404).json({ error: "no ticket" });
+  const c = await one("SELECT json FROM consoles WHERE host_id = ?", [t.host_id]);
+  if (!c) return res.status(404).json({ error: "console not registered" });
+  res.json(JSON.parse(c.json));
+}));
+
+// ---------- WebSocket relay: host (iPhone next to the PS4) <-> one remote client ----------
+// Binary frames are forwarded untouched in both directions. Frame layout (agreed by host + client):
+//   [type:1][id:2 big-endian][payload...]   type 1=TCP_OPEN 2=TCP_DATA 3=TCP_CLOSE 4=UDP_DATA
+// Text frames are JSON control messages sent only by the server (hello, client_connected, client_left, ready).
+// Auth: host sends header x-host-key; client sends "Authorization: Bearer <token>" and ?ticket=<id> (from POST /api/connect).
+const hostConns = new Map(); // hostId -> { id, ws, client, ticket, userId }
+const sendJson = (ws, o) => {
+  try { ws.send(JSON.stringify(o)); } catch (_) {}
+};
+function forward(to, data) {
+  if (!to || to.readyState !== 1) return;
+  // Under congestion drop UDP datagrams (type 4) instead of letting memory grow.
+  if (to.bufferedAmount > 1500000 && data[0] === 4) return;
+  to.send(data, { binary: true });
+}
+async function authHost(req) {
+  const url = new URL(req.url, "http://x");
+  const key = req.headers["x-host-key"] || url.searchParams.get("key") || "";
+  return key ? await one("SELECT * FROM hosts WHERE key_hash = ?", [sha(String(key))]) : undefined;
+}
+async function authClient(req) {
+  const url = new URL(req.url, "http://x");
+  const token = String(req.headers["authorization"] || "").replace("Bearer ", "") || url.searchParams.get("token") || "";
+  const ticketId = url.searchParams.get("ticket") || "";
+  const user = token ? await one("SELECT * FROM users WHERE token = ?", [token]) : undefined;
+  if (!user || user.status === "banned") return null;
+  const ticket = await one("SELECT * FROM tickets WHERE id = ? AND user_id = ? AND status IN ('open','claimed')", [ticketId, user.id]);
+  return ticket ? { user, ticket } : null;
+}
+function onHost(ws, host) {
+  const old = hostConns.get(host.id);
+  if (old) { try { old.ws.close(4000, "replaced"); } catch (_) {} }
+  const entry = { id: host.id, ws, client: null, ticket: null, userId: null };
+  ws.isAlive = true;
+  hostConns.set(host.id, entry);
+  ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("message", (data, isBinary) => { if (isBinary) forward(entry.client, data); });
+  ws.on("close", () => {
+    if (hostConns.get(host.id) === entry) hostConns.delete(host.id);
+    if (entry.client) { try { entry.client.close(4001, "host left"); } catch (_) {} }
+  });
+  ws.on("error", () => {});
+  sendJson(ws, { type: "hello", hostId: host.id });
+  run("UPDATE hosts SET last_seen = ?, state = 'idle' WHERE id = ?", [now(), host.id]).catch(() => {});
+}
+function onClient(ws, user, ticket) {
+  const host = hostConns.get(ticket.host_id);
+  if (!host || host.ws.readyState !== 1) { ws.close(4004, "host offline"); return; }
+  if (host.client) { ws.close(4009, "host busy"); return; }
+  host.client = ws; host.ticket = ticket.id; host.userId = user.id;
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("message", (data, isBinary) => { if (isBinary) forward(host.ws, data); });
+  ws.on("close", () => {
+    if (host.client === ws) {
+      host.client = null; host.ticket = null; host.userId = null;
+      sendJson(host.ws, { type: "client_left" });
+    }
+    run("UPDATE tickets SET status = 'closed' WHERE id = ?", [ticket.id]).catch(() => {});
+    run("UPDATE hosts SET state = 'idle' WHERE id = ?", [host.id]).catch(() => {});
+  });
+  ws.on("error", () => {});
+  sendJson(host.ws, { type: "client_connected", ticket: ticket.id, userId: user.id, name: user.name, muted: !!user.muted });
+  sendJson(ws, { type: "ready" });
+  run("UPDATE tickets SET status = 'claimed' WHERE id = ?", [ticket.id]).catch(() => {});
+  run("UPDATE hosts SET state = 'streaming' WHERE id = ?", [host.id]).catch(() => {});
+}
+async function relayTick() {
+  for (const entry of [...hostConns.values()]) {
+    for (const sock of [entry.ws, entry.client]) {
+      if (!sock) continue;
+      if (sock.isAlive === false) { sock.terminate(); continue; }
+      sock.isAlive = false;
+      try { sock.ping(); } catch (_) {}
+    }
+    await run("UPDATE hosts SET last_seen = ?, state = ? WHERE id = ?", [now(), entry.client ? "streaming" : "idle", entry.id]);
+    if (entry.client && entry.userId) {
+      const u = await one("SELECT status FROM users WHERE id = ?", [entry.userId]);
+      if (!u || u.status === "banned") { try { entry.client.close(4003, "access revoked"); } catch (_) {} }
+    }
+  }
+}
+function attachRelay(server) {
+  if (!WebSocketServer) return;
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20, perMessageDeflate: false });
+  server.on("upgrade", (req, socket, head) => {
+    const path = new URL(req.url, "http://x").pathname;
+    const reject = (code, msg) => {
+      try { socket.write(`HTTP/1.1 ${code} ${msg}\r\nConnection: close\r\n\r\n`); } catch (_) {}
+      socket.destroy();
+    };
+    (async () => {
+      if (path === "/ws/host") {
+        const host = await authHost(req);
+        if (!host) return reject(401, "Unauthorized");
+        wss.handleUpgrade(req, socket, head, (ws) => onHost(ws, host));
+      } else if (path === "/ws/client") {
+        const a = await authClient(req);
+        if (!a) return reject(401, "Unauthorized");
+        wss.handleUpgrade(req, socket, head, (ws) => onClient(ws, a.user, a.ticket));
+      } else {
+        reject(404, "Not Found");
+      }
+    })().catch((e) => { console.error("[relay] upgrade error", e); reject(500, "Error"); });
+  });
+  setInterval(() => relayTick().catch((e) => console.error("[relay] tick", e)), Number(process.env.RELAY_TICK_MS) || 10000);
+  console.log("[relay] WebSocket relay enabled");
+}
+
 // ---------- PS4 PKG app ----------
 // The PKG app polls this to show who is connected and what they play.
 app.get("/ps4/active", ps4Only, wrap(async (_req, res) => {
@@ -281,7 +417,8 @@ app.use((err, _req, res, _next) => {
 
 (async () => {
   await db.executeMultiple(SCHEMA);
-  app.listen(PORT, () => console.log("CloudStation-4 server on :" + PORT));
+  const server = app.listen(PORT, () => console.log("CloudStation-4 server on :" + PORT));
+  attachRelay(server);
 })().catch((e) => {
   console.error("startup failed", e);
   process.exit(1);
